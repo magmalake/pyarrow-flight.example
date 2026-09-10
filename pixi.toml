@@ -1,0 +1,31 @@
+[workspace]
+authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
+channels = ["conda-forge"]
+name = "pyarrow-flight.example"
+version = "0.1.0"
+description = "Reading a Mojo Arrow Flight server from Python with stock pyarrow"
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+python = "3.12.*"
+pyarrow = ">=21"
+# pyarrow's conda build splits Flight into its own library. Without this,
+# `import pyarrow.flight` fails at the dlopen with "not built with support for
+# 'flight'" — which reads like a missing feature rather than a missing package.
+libarrow-flight = ">=21"
+polars = ">=1"
+duckdb = ">=1"
+pandas = ">=2"
+
+[tasks]
+reference-server = { cmd = "python server/reference_server.py" }
+
+example-basic = { cmd = "python client/01_read_a_table.py" }
+example-fanout = { cmd = "python client/02_fan_out.py" }
+example-handoff = { cmd = "python client/03_hand_off.py" }
+example-errors = { cmd = "python client/04_errors.py" }
+
+# Every example against the reference server, which is what CI runs: it proves
+# the client code is correct without needing a Mojo toolchain. Pointing the
+# same examples at flight.mojo is the manual step the README describes.
+check = { cmd = "bash scripts/check.sh" }
