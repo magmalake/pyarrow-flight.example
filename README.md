@@ -110,6 +110,53 @@ For the real thing, see [`server/README.md`](server/README.md):
 fixed table, and `serve-iceberg` hosts a real Iceberg table with one endpoint
 per scan split — that second one is what makes `02_fan_out.py` interesting.
 
+## Daft
+
+`daft_flight/` is a Daft `DataSource`: `GetFlightInfo` becomes Daft's task
+list, `DoGet` becomes a task's batches, and Daft keeps its scheduler, its
+predicates and its aggregations.
+
+```python
+from daft_flight import FlightSource
+
+df = FlightSource("grpc://127.0.0.1:8815", dataset="taxi").read()
+df.where(df["ok"]).groupby("region").agg(daft.col("id").count()).show()
+```
+
+One endpoint becomes one task, so a plan spread over worker processes is read
+from those workers -- `client/05_daft_scan.py` against a coordinator reports
+`6 endpoints, 6 placed` and the rows arrive from two processes.
+
+Only the **limit** is pushed down, because it is the only pushdown Flight can
+express: a ticket is opaque bytes whose meaning is the server's business, and
+there is no field in which to send a predicate. Filters and projection are
+applied by Daft after the read -- correct, but the bytes still crossed the
+wire. That trade, a protocol everyone speaks against pushdowns nobody speaks,
+is the honest cost of an interop seam.
+
+**`daft` on conda-forge is a different project** -- a library for drawing
+probabilistic graphical models. The DataFrame is PyPI-only, which is why it is
+a `[pypi-dependencies]` entry here.
+
+### The in-process alternative
+
+`IcebergLocalSource` is the same source reading through a Mojo shared library
+in this process (`iceberg.mojo`'s `carrow-scan-lib`), handing Daft its Arrow
+buffers over the C Data Interface with nothing encoded, sent or decoded. Same
+plan, same ticket format, same DataFrame; only how a task reads differs. It
+needs that library built, so `pixi run check` does not cover it.
+
+Prefer it whenever it is available: in one process Flight's encode, socket and
+decode are overhead against a function call. Two caveats measured here, both
+worth knowing before choosing:
+
+- A fault in a library you `dlopen` is a fault in *this* process, with no retry
+  boundary. That is the real cost of the in-process path.
+- **Importing pyarrow makes the Mojo reader several times slower** -- without
+  calling it. The same library from a C host runs at full speed, so it is the
+  host process rather than the boundary. A Python host therefore keeps less of
+  the in-process advantage than the theory suggests.
+
 ## What is not here
 
 `DoPut`, `DoExchange` and `DoAction` — Flight can write and can run
