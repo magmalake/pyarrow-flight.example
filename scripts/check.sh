@@ -17,7 +17,8 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-for f in client/01_read_a_table.py client/02_fan_out.py client/03_hand_off.py client/04_errors.py; do
+for f in client/01_read_a_table.py client/02_fan_out.py client/03_hand_off.py \
+         client/04_errors.py client/05_daft_scan.py; do
   echo "=== $f"
   python "$f"
 done

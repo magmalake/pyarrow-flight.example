@@ -17,6 +17,13 @@ polars = ">=1"
 duckdb = ">=1"
 pandas = ">=2"
 
+# Daft is a PyPI-only package. `daft` on conda-forge is a *different project*
+# — a library for drawing probabilistic graphical models — so asking conda for
+# it installs something unrelated that imports cleanly and then has no
+# DataFrame on it.
+[pypi-dependencies]
+daft = ">=0.7,<0.8"
+
 [tasks]
 reference-server = { cmd = "python server/reference_server.py" }
 
@@ -24,6 +31,9 @@ example-basic = { cmd = "python client/01_read_a_table.py" }
 example-fanout = { cmd = "python client/02_fan_out.py" }
 example-handoff = { cmd = "python client/03_hand_off.py" }
 example-errors = { cmd = "python client/04_errors.py" }
+# Daft, through the connector in daft_flight/. The in-process source needs a
+# Mojo-built shared library and so is not part of `check`; see the README.
+example-daft = { cmd = "python client/05_daft_scan.py" }
 
 # Every example against the reference server, which is what CI runs: it proves
 # the client code is correct without needing a Mojo toolchain. Pointing the
