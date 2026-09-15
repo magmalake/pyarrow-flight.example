@@ -40,6 +40,7 @@ interop seam.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, NamedTuple
 
 import pyarrow.flight as fl
@@ -155,8 +156,19 @@ class _FlightTask(DataSourceTask):
         """
         seen = 0
         with fl.connect(self._uri) as client:
-            reader = client.do_get(fl.Ticket(self._ticket))
-            for chunk in reader:
+            reader = await asyncio.to_thread(
+                client.do_get, fl.Ticket(self._ticket)
+            )
+            while True:
+                # Off the event loop. `read_chunk` blocks for as long as the
+                # server takes, and Daft drives these tasks on one loop: a
+                # blocking call here stalls every other task, so a fan-out
+                # over N endpoints runs in exactly the time N sequential
+                # reads would take. pyarrow releases the GIL for the transfer
+                # and the decode, so a thread per task is real parallelism.
+                chunk = await asyncio.to_thread(_next_chunk, reader)
+                if chunk is None:
+                    return
                 batch = chunk.data
                 # A per-task limit is the one pushdown that saves real bytes,
                 # and it is safe because a limit is "at most": Daft still
@@ -172,6 +184,19 @@ class _FlightTask(DataSourceTask):
                 yield RecordBatch.from_arrow_record_batches(
                     [batch], self._arrow_schema
                 )
+
+
+def _next_chunk(reader):
+    """One chunk, or None at end of stream.
+
+    `StopIteration` must not be raised inside a thread that an async
+    generator is awaiting -- it means something else there -- so the sentinel
+    crosses the boundary instead of the exception.
+    """
+    try:
+        return reader.read_chunk()
+    except StopIteration:
+        return None
 
 
 def _uri_of(location: fl.Location) -> str:

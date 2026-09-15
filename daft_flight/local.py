@@ -32,6 +32,7 @@ real cost of the in-process path, and it is worth stating next to the speed.
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import os
 from typing import TYPE_CHECKING
@@ -216,8 +217,18 @@ class _LocalTask(DataSourceTask):
         if self._shim_prefix:
             _use_shims_from(self._shim_prefix)
         lib = _bind(self._lib_path)
-        addr = lib.ib_scan_split(
-            self._table_dir, self._ticket, self._split_size, self._columns
+        # Off the event loop. The library reads the whole split before it
+        # returns an address, so this call blocks for as long as the scan
+        # takes -- and Daft drives these tasks on one loop, where a blocking
+        # call stalls every other task. ctypes releases the GIL for the
+        # duration of a foreign call, so a thread per task is real
+        # parallelism rather than a queue with extra steps.
+        addr = await asyncio.to_thread(
+            lib.ib_scan_split,
+            self._table_dir,
+            self._ticket,
+            self._split_size,
+            self._columns,
         )
         if not addr:
             # An empty split is a legal answer — a stale ticket names a task
