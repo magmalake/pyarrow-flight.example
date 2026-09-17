@@ -197,13 +197,13 @@ each way across the boundary and prints them side by side. Apple M4, warm
 cache, p50 of five reads:
 
 ```
-  in-process (C Data Interface)         91.1 ms     1.0x   79,478,796 rows
-  Flight — pyarrow server              148.0 ms     1.6x   79,478,796 rows
-  Flight — flight.mojo server          800.4 ms     8.8x   79,478,796 rows
+  in-process (C Data Interface)         88.8 ms     1.0x   79,478,796 rows
+  Flight — pyarrow server              147.1 ms     1.7x   79,478,796 rows
+  Flight — flight.mojo server          389.3 ms     4.4x   79,478,796 rows
 
   the handover alone — one column, already Arrow, no Parquet in it:
-  Arrow IPC, memory-mapped (zero copy)           23.2 ms
-  Arrow IPC, read into the heap (one copy)       52.6 ms
+  Arrow IPC, memory-mapped (zero copy)           25.1 ms
+  Arrow IPC, read into the heap (one copy)       55.5 ms
 ```
 
 **Crossing a process costs 1.6×, not an order of magnitude.** Two servers
@@ -211,11 +211,14 @@ rather than one, on purpose: a client timed against a single server reports
 the protocol and that server's implementation as one number, and only a second
 implementation separates them. It separated them decisively here —
 `flight.mojo` served this column in **12.1 s** when the table was first
-measured, and the difference was never gRPC. Three things were: byte-at-a-time
+measured, and the difference was never gRPC. Four things were: byte-at-a-time
 copies in four places (→ 6.0 s), gzip applied to every Arrow batch because the
-client advertised `grpc-accept-encoding: gzip` (→ 3.1 s), and a full table scan
-on every call to learn the schema (→ 800 ms). `FLIGHT_TIMING=1` on that server
-is what found them: it reported 16 ms of work against a client waiting 1236 ms.
+client advertised `grpc-accept-encoding: gzip` (→ 3.1 s), a full table scan on
+every call to learn the schema (→ 800 ms), and a quadratic in the HTTP/2 flow
+control — both pump paths re-copied the whole parked body on every
+`WINDOW_UPDATE`, about 6 GB of copying to send 28 MB (→ 389 ms).
+`FLIGHT_TIMING=1` on that server is what started it: 16 ms of work against a
+client waiting 1236 ms put the search on the far side of the handler.
 
 Every leg asserts the same row count, because a transport that is fast
 because it lost rows is not fast. Legs whose pieces are missing are skipped
