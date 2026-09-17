@@ -255,14 +255,19 @@ class IcebergLocalSource(DataSource):
         Those columns are read whether or not the predicate was pushed, and
         that is the honest cost of leaving the filter to Daft: the pushdown
         saves pages and row groups, not the column.
+
+        The order is the **source schema's**, not the order Daft asked in.
+        Daft lines a task's columns up against the source schema by position,
+        so a task that returns them in the order of `pushdowns.columns` hands
+        back the right data under the wrong names whenever those two orders
+        differ -- a group-by on `PULocationID` silently grouping by
+        `total_amount`, with no error anywhere. It is a projection either way;
+        only the order is load-bearing.
         """
         if pushdowns.columns is None:
             return None
-        names = list(pushdowns.columns)
-        for name in sorted(pushdowns.filter_required_column_names()):
-            if name not in names:
-                names.append(name)
-        return names
+        names = set(pushdowns.columns) | pushdowns.filter_required_column_names()
+        return [n for n in self._arrow_schema.names if n in names]
 
     def _project(self, columns: list[str] | None) -> pa.Schema:
         """The schema of what a task will return under this projection.
