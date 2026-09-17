@@ -210,8 +210,10 @@ are `server/parquet_server.py` — pyarrow's own Flight server over the same
 files — rather than the Mojo one, on purpose: a client timed against one
 server reports the protocol and that server's encoder as a single number, and
 only a second implementation separates them. Pointing the same run at
-`flight.mojo` (it starts one if `build/serve_ice` is there) gives 12.1 s for
-the same column, which is that server's encoder and not gRPC.
+`flight.mojo` (it starts one if `build/serve_ice` is there) gives 6.0 s for
+the same column — 12.1 s before its encoder stopped moving the batch a byte at
+a time, and still 40× pyarrow's server for reasons not yet traced. None of it
+is gRPC, which is the point of having two servers in the table.
 
 Every leg asserts the same row count, because a transport that is fast
 because it lost rows is not fast. Legs whose pieces are missing are skipped
