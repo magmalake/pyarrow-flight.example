@@ -38,6 +38,11 @@ example-daft = { cmd = "python client/05_daft_scan.py" }
 # Needs neither a server nor Mojo: the translation is a function.
 example-pushdown = { cmd = "python client/06_pushdown.py" }
 
+# What the boundary costs: one column of a real table read in this process and
+# over Flight from two servers. Needs a warehouse, iceberg.mojo's scan library
+# and (for the third leg) flight.mojo's server, so it is not part of `check`.
+transports = { cmd = "bash scripts/transports.sh" }
+
 # Every example against the reference server, which is what CI runs: it proves
 # the client code is correct without needing a Mojo toolchain. Pointing the
 # same examples at flight.mojo is the manual step the README describes.

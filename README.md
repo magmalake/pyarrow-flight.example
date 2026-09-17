@@ -190,6 +190,45 @@ Measured on that table, same answers on both sides: a quarter of 2024 summed,
 predicate that prunes nothing (`trip_distance > 0`, true of nearly every row)
 costs about 10% -- the residual is evaluated and nothing is dropped.
 
+## What the boundary costs
+
+`pixi run transports` reads one column of a 79.5M-row Iceberg table through
+each way across the boundary and prints them side by side. Apple M4, warm
+cache, p50 of five reads:
+
+```
+  in-process (C Data Interface)         88.4 ms     1.0x   79,478,796 rows
+  Flight — pyarrow server              149.5 ms     1.7x   79,478,796 rows
+
+  the handover alone — one column, already Arrow, no Parquet in it:
+  Arrow IPC, memory-mapped (zero copy)           27.8 ms
+  Arrow IPC, read into the heap (one copy)       58.1 ms
+```
+
+**Crossing a process costs 1.7×, not an order of magnitude.** The Flight rows
+are `server/parquet_server.py` — pyarrow's own Flight server over the same
+files — rather than the Mojo one, on purpose: a client timed against one
+server reports the protocol and that server's encoder as a single number, and
+only a second implementation separates them. Pointing the same run at
+`flight.mojo` (it starts one if `build/serve_ice` is there) gives 12.1 s for
+the same column, which is that server's encoder and not gRPC.
+
+Every leg asserts the same row count, because a transport that is fast
+because it lost rows is not fast. Legs whose pieces are missing are skipped
+with a note. It needs the taxi table from
+[`taxibench.example`](https://github.com/magmalake/taxibench.example)
+(`pixi run load` there), and `TAXI_TABLE` points it anywhere else.
+
+A Unix socket is not faster here — 582 ms against 149 ms on macOS, measured
+either side of the TCP run. `server/parquet_server.py --unix /tmp/f.sock` is
+how to try it on your own machine before believing either of us.
+
+The two handover lines answer a different question: what it costs a consumer
+to reach buffers that are already Arrow, with no Parquet in the path. The gap
+between them is one copy of 636 MB, which is the whole of what a shared
+mapping would save — and the reason the C Data Interface cannot do it across
+processes is that it hands over pointers.
+
 ## What is not here
 
 `DoPut`, `DoExchange` and `DoAction` — Flight can write and can run
