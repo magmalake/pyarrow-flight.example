@@ -34,6 +34,9 @@ example-errors = { cmd = "python client/04_errors.py" }
 # Daft, through the connector in daft_flight/. The in-process source needs a
 # Mojo-built shared library and so is not part of `check`; see the README.
 example-daft = { cmd = "python client/05_daft_scan.py" }
+# What the in-process source pushes into the library, and what it declines to.
+# Needs neither a server nor Mojo: the translation is a function.
+example-pushdown = { cmd = "python client/06_pushdown.py" }
 
 # Every example against the reference server, which is what CI runs: it proves
 # the client code is correct without needing a Mojo toolchain. Pointing the

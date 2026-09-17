@@ -127,12 +127,13 @@ One endpoint becomes one task, so a plan spread over worker processes is read
 from those workers -- `client/05_daft_scan.py` against a coordinator reports
 `6 endpoints, 6 placed` and the rows arrive from two processes.
 
-Only the **limit** is pushed down, because it is the only pushdown Flight can
-express: a ticket is opaque bytes whose meaning is the server's business, and
-there is no field in which to send a predicate. Filters and projection are
-applied by Daft after the read -- correct, but the bytes still crossed the
-wire. That trade, a protocol everyone speaks against pushdowns nobody speaks,
-is the honest cost of an interop seam.
+Over Flight, only the **limit** is pushed down, because it is the only pushdown
+Flight can express: a ticket is opaque bytes whose meaning is the server's
+business, and there is no field in which to send a predicate. Filters and
+projection are applied by Daft after the read -- correct, but the bytes still
+crossed the wire. That trade, a protocol everyone speaks against pushdowns
+nobody speaks, is the honest cost of an interop seam. The in-process source
+below is where that cost goes away.
 
 **`daft` on conda-forge is a different project** -- a library for drawing
 probabilistic graphical models. The DataFrame is PyPI-only, which is why it is
@@ -147,15 +148,47 @@ plan, same ticket format, same DataFrame; only how a task reads differs. It
 needs that library built, so `pixi run check` does not cover it.
 
 Prefer it whenever it is available: in one process Flight's encode, socket and
-decode are overhead against a function call. Two caveats measured here, both
-worth knowing before choosing:
+decode are overhead against a function call.
 
-- A fault in a library you `dlopen` is a fault in *this* process, with no retry
-  boundary. That is the real cost of the in-process path.
-- **Importing pyarrow makes the Mojo reader several times slower** -- without
-  calling it. The same library from a C host runs at full speed, so it is the
-  host process rather than the boundary. A Python host therefore keeps less of
-  the in-process advantage than the theory suggests.
+The cost worth knowing before choosing: a fault in a library you `dlopen` is a
+fault in *this* process, with no retry boundary. Flight has one; this does not.
+
+#### It pushes down what Flight cannot
+
+There is no ticket here to be opaque about, so Daft's pushdowns reach the
+reader. The projection goes to the Parquet decoder, and the **predicate** goes
+to Iceberg -- as its filter DSL, translated by `daft_flight/predicate.py`, a
+JSON s-expression:
+
+```python
+col("tpep_pickup_datetime") >= lit(datetime(2024, 7, 1))
+# ["gteq", "tpep_pickup_datetime", "2024-07-01T00:00:00"]
+```
+
+A predicate is worth pushing twice over. At **plan** time Iceberg prunes on
+partition values and file statistics, so the task list itself comes back
+shorter -- on the 79.5M-row taxi table, partitioned by month, a date range
+turns 24 splits into 3. At **read** time what is left becomes the residual,
+which drops row groups and pages on the Parquet footer before anything is
+decompressed. A reader that filters afterwards gets neither.
+
+Daft applies the filter to what comes back regardless, so pushing changes what
+is decoded and never what is returned. That is what makes a *partial* push
+safe: in `A and B` with only `A` translatable, `A` alone goes down, because `A`
+is implied by `A and B` and so cannot prune a row the filter would have kept.
+An `or` has no such property and is pushed whole or not at all. Anything
+Iceberg has no vocabulary for -- a function, a cast, a comparison between two
+columns -- is simply not pushed. `client/06_pushdown.py` is the translation on
+its own, and needs neither a server nor Mojo:
+
+```sh
+pixi run example-pushdown
+```
+
+Measured on that table, same answers on both sides: a quarter of 2024 summed,
+225 ms -> 58 ms; a selective three-predicate count, 243 ms -> 168 ms. A
+predicate that prunes nothing (`trip_distance > 0`, true of nearly every row)
+costs about 10% -- the residual is evaluated and nothing is dropped.
 
 ## What is not here
 
