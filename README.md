@@ -197,13 +197,13 @@ each way across the boundary and prints them side by side. Apple M4, warm
 cache, p50 of five reads:
 
 ```
-  in-process (C Data Interface)         88.8 ms     1.0x   79,478,796 rows
-  Flight — pyarrow server              147.1 ms     1.7x   79,478,796 rows
-  Flight — flight.mojo server          389.3 ms     4.4x   79,478,796 rows
+  in-process (C Data Interface)         89.3 ms     1.0x   79,478,796 rows
+  Flight — pyarrow server              159.5 ms     1.8x   79,478,796 rows
+  Flight — flight.mojo server          390.9 ms     4.4x   79,478,796 rows
 
   the handover alone — one column, already Arrow, no Parquet in it:
-  Arrow IPC, memory-mapped (zero copy)           25.1 ms
-  Arrow IPC, read into the heap (one copy)       55.5 ms
+  Arrow IPC, memory-mapped (zero copy)           23.8 ms
+  Arrow IPC, read into the heap (one copy)       53.9 ms
 ```
 
 **Crossing a process costs 1.6×, not an order of magnitude.** Two servers
@@ -216,7 +216,7 @@ copies in four places (→ 6.0 s), gzip applied to every Arrow batch because the
 client advertised `grpc-accept-encoding: gzip` (→ 3.1 s), a full table scan on
 every call to learn the schema (→ 800 ms), and a quadratic in the HTTP/2 flow
 control — both pump paths re-copied the whole parked body on every
-`WINDOW_UPDATE`, about 6 GB of copying to send 28 MB (→ 389 ms).
+`WINDOW_UPDATE`, about 6 GB of copying to send 28 MB (→ 391 ms).
 `FLIGHT_TIMING=1` on that server is what started it: 16 ms of work against a
 client waiting 1236 ms put the search on the far side of the handler.
 
@@ -226,7 +226,7 @@ with a note. It needs the taxi table from
 [`taxibench.example`](https://github.com/magmalake/taxibench.example)
 (`pixi run load` there), and `TAXI_TABLE` points it anywhere else.
 
-A Unix socket is not faster here — 582 ms against 149 ms on macOS, measured
+A Unix socket is not faster here — 581 ms against 149 ms on macOS, measured
 either side of the TCP run. `server/parquet_server.py --unix /tmp/f.sock` is
 how to try it on your own machine before believing either of us.
 
