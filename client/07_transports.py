@@ -30,7 +30,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from daft_flight import FlightSource, IcebergLocalSource
+from daft_flight import FlightSource, IcebergLocalSource, ShmSource
 
 TABLE = os.environ.get("TAXI_TABLE", "")
 LIB = os.environ.get("IB_LIB", "")
@@ -107,6 +107,15 @@ for name, env in (("Flight — pyarrow server", "PYARROW_FLIGHT_URI"),
     uri = os.environ.get(env)
     if uri:
         legs.append((name, lambda uri=uri: FlightSource(uri, dataset="taxi")))
+
+# The same server, answering with the name of a mapping instead of the rows.
+# Flight stays the control plane; only DoGet changes.
+shm_uri = os.environ.get("SHM_FLIGHT_URI")
+if shm_uri:
+    legs.append(
+        ("shared mapping, named by Flight",
+         lambda uri=shm_uri: ShmSource(uri, dataset="taxi"))
+    )
 
 if not legs:
     raise SystemExit("nothing to measure: set IB_LIB and TAXI_TABLE, or a *_FLIGHT_URI")

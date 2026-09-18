@@ -21,6 +21,7 @@ import argparse
 import glob
 import json
 import os
+import tempfile
 
 import pyarrow as pa
 import pyarrow.flight as fl
@@ -39,8 +40,11 @@ def data_files(table_dir: str) -> list[str]:
 
 
 class ParquetFlight(fl.FlightServerBase):
-    def __init__(self, location: str, table_dir: str, column: str) -> None:
+    def __init__(
+        self, location: str, table_dir: str, column: str, shm_dir: str | None = None
+    ) -> None:
         super().__init__(location=location)
+        self._shm_dir = shm_dir
         self._files = data_files(table_dir)
         if not self._files:
             raise SystemExit(f"no Parquet files under {table_dir}/data")
@@ -59,10 +63,39 @@ class ParquetFlight(fl.FlightServerBase):
     def get_schema(self, context, descriptor):
         return fl.SchemaResult(self._schema)
 
+    @property
+    def data_schema(self) -> pa.Schema:
+        """What the rows look like, whichever way they travel."""
+        return self._schema
+
     def do_get(self, context, ticket):
         path = json.loads(ticket.ticket.decode())["file"]
         reader = pq.ParquetFile(path).iter_batches(columns=[self._column])
-        return fl.GeneratorStream(self._schema, reader)
+        if self._shm_dir is None:
+            return fl.GeneratorStream(self._schema, reader)
+        return fl.RecordBatchStream(pa.table({"path": [self._publish(reader)]}))
+
+    def _publish(self, reader) -> str:
+        """Write this endpoint's rows into a mapping and return its name.
+
+        The rows never go on the wire: what `DoGet` returns is a path, and the
+        client maps it. Arrow's IPC *file* layout is the in-memory layout with
+        every buffer 8-byte aligned, so mapping it is not a decode — the
+        consumer points at the buffers where they lie.
+
+        A file in a tmpfs (`/dev/shm` on Linux) or in the page cache (macOS
+        has no `/dev/shm`, and a file under `/tmp` written and read straight
+        back never reaches a disk) is the portable spelling of a shared
+        segment. `shm_open` would be the other, and would trade the path for a
+        file descriptor to pass — the same handover either way.
+        """
+        fd, path = tempfile.mkstemp(suffix=".arrow", dir=self._shm_dir)
+        os.close(fd)
+        with pa.OSFile(path, "wb") as sink:
+            with pa.ipc.new_file(sink, self._schema) as writer:
+                for batch in reader:
+                    writer.write_batch(batch)
+        return path
 
 
 if __name__ == "__main__":
@@ -74,12 +107,21 @@ if __name__ == "__main__":
     # takes the loopback stack out without changing a line of client code
     # beyond the URI.
     ap.add_argument("--unix", help="serve on this Unix socket instead of a TCP port")
+    # Flight as the control plane and a mapping as the data plane: a ticket is
+    # opaque bytes, so a server that knows its client is on the same host can
+    # answer with the name of a segment instead of the rows.
+    ap.add_argument(
+        "--shm-dir",
+        help="write each endpoint into a mapping under this directory and"
+        " return its path rather than streaming the rows",
+    )
     args = ap.parse_args()
     location = f"grpc+unix://{args.unix}" if args.unix else f"grpc://127.0.0.1:{args.port}"
-    server = ParquetFlight(location, args.table, args.column)
+    server = ParquetFlight(location, args.table, args.column, args.shm_dir)
     print(
         f"pyarrow flight server on {location}:"
-        f" {len(server._files)} files, {server._rows:,} rows, column {args.column}",
+        f" {len(server._files)} files, {server._rows:,} rows, column {args.column}"
+        + (f", handing over mappings under {args.shm_dir}" if args.shm_dir else ""),
         flush=True,
     )
     server.serve()

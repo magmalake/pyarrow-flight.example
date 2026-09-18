@@ -24,6 +24,7 @@ IB_LIB="${IB_LIB:-$ROOT/../iceberg.mojo/build/libibscan.dylib}"
 FLIGHT_MOJO="${FLIGHT_MOJO:-$ROOT/../flight.mojo}"
 COLUMN="${TAXI_COLUMN:-trip_distance}"
 PYARROW_PORT="${PYARROW_PORT:-18816}"
+SHM_PORT="${SHM_PORT:-18817}"
 MOJO_PORT="${MOJO_PORT:-18815}"
 # The Mojo tins dlopen their codec shims from $CONDA_PREFIX/lib; a server
 # started outside its own environment looks in the wrong place and aborts on
@@ -33,7 +34,17 @@ SHIM_PREFIX="${MAGMALAKE_SHIM_PREFIX:-$ROOT/../iceberg.mojo/.pixi/envs/default}"
 [ "$(uname -s)" = "Darwin" ] || IB_LIB="${IB_LIB%.dylib}.so"
 
 PIDS=()
-cleanup() { for pid in ${PIDS+"${PIDS[@]}"}; do kill "$pid" 2>/dev/null || true; done; }
+cleanup() {
+    # `wait` after the kill, so bash reaps each server quietly instead of
+    # printing "Terminated" over the results the run just produced.
+    for pid in ${PIDS+"${PIDS[@]}"}; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    # A mapping the client never got to unlink would otherwise be left behind.
+    [ -n "${SHM_DIR:-}" ] && rm -rf "$SHM_DIR"
+    return 0
+}
 trap cleanup EXIT
 
 wait_for() {  # <port> <what>
@@ -70,7 +81,21 @@ PYARROW_URI=""
 wait_for "$PYARROW_PORT" "the pyarrow server" && \
     PYARROW_URI="grpc://127.0.0.1:$PYARROW_PORT"
 
-# Leg 3: flight.mojo's Iceberg server. It runs under its own pixi environment,
+# Leg 3: the same pyarrow server, handing over a mapping rather than the rows
+# — Flight as the control plane, which is available because a ticket is opaque
+# bytes. On Linux the directory is a tmpfs; macOS has no /dev/shm and a file
+# under /tmp written and read straight back never reaches a disk.
+SHM_DIR="${SHM_DIR:-${TMPDIR:-/tmp}/flight-shm}"
+[ -d /dev/shm ] && SHM_DIR="${SHM_DIR_OVERRIDE:-/dev/shm/flight-shm}"
+mkdir -p "$SHM_DIR"
+python server/parquet_server.py "$TAXI_TABLE" --port "$SHM_PORT" \
+    --column "$COLUMN" --shm-dir "$SHM_DIR" > /tmp/shm-flight.log 2>&1 &
+PIDS+=($!)
+SHM_URI=""
+wait_for "$SHM_PORT" "the mapping server" && \
+    SHM_URI="grpc://127.0.0.1:$SHM_PORT"
+
+# Leg 4: flight.mojo's Iceberg server. It runs under its own pixi environment,
 # which is where its codec shims are.
 MOJO_URI=""
 if [ -x "$FLIGHT_MOJO/build/serve_ice" ]; then
@@ -88,4 +113,5 @@ fi
 TAXI_TABLE="$TAXI_TABLE" IB_LIB="$IB_LIB" TAXI_COLUMN="$COLUMN" \
 MAGMALAKE_SHIM_PREFIX="$SHIM_PREFIX" \
 PYARROW_FLIGHT_URI="$PYARROW_URI" MOJO_FLIGHT_URI="$MOJO_URI" \
+SHM_FLIGHT_URI="$SHM_URI" \
     python client/07_transports.py
