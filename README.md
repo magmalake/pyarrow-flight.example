@@ -127,12 +127,13 @@ One endpoint becomes one task, so a plan spread over worker processes is read
 from those workers -- `client/05_daft_scan.py` against a coordinator reports
 `6 endpoints, 6 placed` and the rows arrive from two processes.
 
-Only the **limit** is pushed down, because it is the only pushdown Flight can
-express: a ticket is opaque bytes whose meaning is the server's business, and
-there is no field in which to send a predicate. Filters and projection are
-applied by Daft after the read -- correct, but the bytes still crossed the
-wire. That trade, a protocol everyone speaks against pushdowns nobody speaks,
-is the honest cost of an interop seam.
+Over Flight, only the **limit** is pushed down, because it is the only pushdown
+Flight can express: a ticket is opaque bytes whose meaning is the server's
+business, and there is no field in which to send a predicate. Filters and
+projection are applied by Daft after the read -- correct, but the bytes still
+crossed the wire. That trade, a protocol everyone speaks against pushdowns
+nobody speaks, is the honest cost of an interop seam. The in-process source
+below is where that cost goes away.
 
 **`daft` on conda-forge is a different project** -- a library for drawing
 probabilistic graphical models. The DataFrame is PyPI-only, which is why it is
@@ -147,15 +148,93 @@ plan, same ticket format, same DataFrame; only how a task reads differs. It
 needs that library built, so `pixi run check` does not cover it.
 
 Prefer it whenever it is available: in one process Flight's encode, socket and
-decode are overhead against a function call. Two caveats measured here, both
-worth knowing before choosing:
+decode are overhead against a function call.
 
-- A fault in a library you `dlopen` is a fault in *this* process, with no retry
-  boundary. That is the real cost of the in-process path.
-- **Importing pyarrow makes the Mojo reader several times slower** -- without
-  calling it. The same library from a C host runs at full speed, so it is the
-  host process rather than the boundary. A Python host therefore keeps less of
-  the in-process advantage than the theory suggests.
+The cost worth knowing before choosing: a fault in a library you `dlopen` is a
+fault in *this* process, with no retry boundary. Flight has one; this does not.
+
+#### It pushes down what Flight cannot
+
+There is no ticket here to be opaque about, so Daft's pushdowns reach the
+reader. The projection goes to the Parquet decoder, and the **predicate** goes
+to Iceberg -- as its filter DSL, translated by `daft_flight/predicate.py`, a
+JSON s-expression:
+
+```python
+col("tpep_pickup_datetime") >= lit(datetime(2024, 7, 1))
+# ["gteq", "tpep_pickup_datetime", "2024-07-01T00:00:00"]
+```
+
+A predicate is worth pushing twice over. At **plan** time Iceberg prunes on
+partition values and file statistics, so the task list itself comes back
+shorter -- on the 79.5M-row taxi table, partitioned by month, a date range
+turns 24 splits into 3. At **read** time what is left becomes the residual,
+which drops row groups and pages on the Parquet footer before anything is
+decompressed. A reader that filters afterwards gets neither.
+
+Daft applies the filter to what comes back regardless, so pushing changes what
+is decoded and never what is returned. That is what makes a *partial* push
+safe: in `A and B` with only `A` translatable, `A` alone goes down, because `A`
+is implied by `A and B` and so cannot prune a row the filter would have kept.
+An `or` has no such property and is pushed whole or not at all. Anything
+Iceberg has no vocabulary for -- a function, a cast, a comparison between two
+columns -- is simply not pushed. `client/06_pushdown.py` is the translation on
+its own, and needs neither a server nor Mojo:
+
+```sh
+pixi run example-pushdown
+```
+
+Measured on that table, same answers on both sides: a quarter of 2024 summed,
+225 ms -> 58 ms; a selective three-predicate count, 243 ms -> 168 ms. A
+predicate that prunes nothing (`trip_distance > 0`, true of nearly every row)
+costs about 10% -- the residual is evaluated and nothing is dropped.
+
+## What the boundary costs
+
+`pixi run transports` reads one column of a 79.5M-row Iceberg table through
+each way across the boundary and prints them side by side. Apple M4, warm
+cache, p50 of five reads:
+
+```
+  in-process (C Data Interface)         89.3 ms     1.0x   79,478,796 rows
+  Flight — pyarrow server              159.5 ms     1.8x   79,478,796 rows
+  Flight — flight.mojo server          390.9 ms     4.4x   79,478,796 rows
+
+  the handover alone — one column, already Arrow, no Parquet in it:
+  Arrow IPC, memory-mapped (zero copy)           23.8 ms
+  Arrow IPC, read into the heap (one copy)       53.9 ms
+```
+
+**Crossing a process costs 1.6×, not an order of magnitude.** Two servers
+rather than one, on purpose: a client timed against a single server reports
+the protocol and that server's implementation as one number, and only a second
+implementation separates them. It separated them decisively here —
+`flight.mojo` served this column in **12.1 s** when the table was first
+measured, and the difference was never gRPC. Four things were: byte-at-a-time
+copies in four places (→ 6.0 s), gzip applied to every Arrow batch because the
+client advertised `grpc-accept-encoding: gzip` (→ 3.1 s), a full table scan on
+every call to learn the schema (→ 800 ms), and a quadratic in the HTTP/2 flow
+control — both pump paths re-copied the whole parked body on every
+`WINDOW_UPDATE`, about 6 GB of copying to send 28 MB (→ 391 ms).
+`FLIGHT_TIMING=1` on that server is what started it: 16 ms of work against a
+client waiting 1236 ms put the search on the far side of the handler.
+
+Every leg asserts the same row count, because a transport that is fast
+because it lost rows is not fast. Legs whose pieces are missing are skipped
+with a note. It needs the taxi table from
+[`taxibench.example`](https://github.com/magmalake/taxibench.example)
+(`pixi run load` there), and `TAXI_TABLE` points it anywhere else.
+
+A Unix socket is not faster here — 581 ms against 149 ms on macOS, measured
+either side of the TCP run. `server/parquet_server.py --unix /tmp/f.sock` is
+how to try it on your own machine before believing either of us.
+
+The two handover lines answer a different question: what it costs a consumer
+to reach buffers that are already Arrow, with no Parquet in the path. The gap
+between them is one copy of 636 MB, which is the whole of what a shared
+mapping would save — and the reason the C Data Interface cannot do it across
+processes is that it hands over pointers.
 
 ## What is not here
 
