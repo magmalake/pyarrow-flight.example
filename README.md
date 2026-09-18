@@ -198,12 +198,13 @@ cache, p50 of five reads:
 
 ```
   in-process (C Data Interface)         89.3 ms     1.0x   79,478,796 rows
-  Flight — pyarrow server              159.5 ms     1.8x   79,478,796 rows
-  Flight — flight.mojo server          390.9 ms     4.4x   79,478,796 rows
+  Flight — pyarrow server              152.1 ms     1.7x   79,478,796 rows
+  Flight — flight.mojo server          383.9 ms     4.3x   79,478,796 rows
+  shared mapping, named by Flight      237.7 ms     2.7x   79,478,796 rows
 
   the handover alone — one column, already Arrow, no Parquet in it:
-  Arrow IPC, memory-mapped (zero copy)           23.8 ms
-  Arrow IPC, read into the heap (one copy)       53.9 ms
+  Arrow IPC, memory-mapped (zero copy)           27.7 ms
+  Arrow IPC, read into the heap (one copy)       57.8 ms
 ```
 
 **Crossing a process costs 1.6×, not an order of magnitude.** Two servers
@@ -225,6 +226,20 @@ because it lost rows is not fast. Legs whose pieces are missing are skipped
 with a note. It needs the taxi table from
 [`taxibench.example`](https://github.com/magmalake/taxibench.example)
 (`pixi run load` there), and `TAXI_TABLE` points it anywhere else.
+
+**The shared mapping is the interesting one.** `daft_flight/shm.py` is the same
+Flight plan with a different `DoGet`: the server writes an endpoint's rows into
+a mapping and returns its *path*, and the client maps it — legal because a
+ticket is opaque bytes, and useful because Arrow's IPC file layout is the
+in-memory layout, so mapping it is not a decode. The C Data Interface cannot do
+this across processes at all; it hands over pointers.
+
+It still loses to streaming, for a reason worth knowing: the consumer's half is
+nearly free (1.9 ms to map one endpoint and fold every value, against 12 ms to
+stream it) but the producer has to get the rows *into* the mapping, and those
+writes overlap far worse than a stream does — 1.3× across 24 endpoints where
+streaming manages 2.4×. Avoiding one copy pays for another until the buffers
+are allocated in the mapping to begin with.
 
 A Unix socket is not faster here — 581 ms against 149 ms on macOS, measured
 either side of the TCP run. `server/parquet_server.py --unix /tmp/f.sock` is
