@@ -183,6 +183,27 @@ for name, env in (("Flight — pyarrow server", "PYARROW_FLIGHT_URI"),
     if uri:
         legs.append((name, lambda uri=uri: FlightSource(uri, dataset="taxi")))
 
+# The producer writing its Arrow buffers straight into a mapping, with no
+# encode at all — `iceberg.mojo` scanning, this process pointing at the result.
+publisher_bin = os.environ.get("SHM_PUBLISH_BIN")
+if publisher_bin and TABLE and os.path.exists(publisher_bin):
+    from daft_flight.shm_direct import ShmDirectSource, _Publisher
+
+    _pub = _Publisher(
+        publisher_bin,
+        TABLE,
+        COLUMN,
+        os.environ.get("SHM_DIRECT_DIR", "/tmp/ib-shm"),
+        SPLIT_SIZE,
+        env={"CONDA_PREFIX": os.environ["MAGMALAKE_SHIM_PREFIX"]}
+        if os.environ.get("MAGMALAKE_SHIM_PREFIX")
+        else None,
+    )
+    legs.append(
+        ("shared memory, Mojo writes the buffers",
+         lambda: ShmDirectSource(_pub))
+    )
+
 # The same server, answering with the name of a mapping instead of the rows.
 # Flight stays the control plane; only DoGet changes.
 shm_uri = os.environ.get("SHM_FLIGHT_URI")
