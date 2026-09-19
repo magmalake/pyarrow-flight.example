@@ -197,17 +197,27 @@ each way across the boundary and prints them side by side. Apple M4, warm
 cache, p50 of five reads:
 
 ```
-  in-process (C Data Interface)         89.3 ms     1.0x   79,478,796 rows
-  Flight — pyarrow server              152.1 ms     1.7x   79,478,796 rows
-  Flight — flight.mojo server          383.9 ms     4.3x   79,478,796 rows
-  shared mapping, named by Flight      237.7 ms     2.7x   79,478,796 rows
+  in-process (pyarrow, no boundary)      62.3 ms     1.0x   79,478,796 rows
+  in-process (C Data Interface)          89.2 ms     1.4x   79,478,796 rows
+  Flight — pyarrow server               150.5 ms     2.4x   79,478,796 rows
+  Flight — flight.mojo server           377.0 ms     6.1x   79,478,796 rows
+  shared mapping, named by Flight       236.6 ms     3.8x   79,478,796 rows
 
   the handover alone — one column, already Arrow, no Parquet in it:
-  Arrow IPC, memory-mapped (zero copy)           27.7 ms
-  Arrow IPC, read into the heap (one copy)       57.8 ms
+  Arrow IPC, memory-mapped (zero copy)           25.4 ms
+  Arrow IPC, read into the heap (one copy)       56.3 ms
 ```
 
-**Crossing a process costs 1.6×, not an order of magnitude.** Two servers
+**The first leg is the control**, and it is what makes the rest mean anything:
+pyarrow reading the files and handing Daft the batches, which is exactly what
+the Flight server does minus the wire. Without it the baseline would be
+`iceberg.mojo` reading an Iceberg table while every Flight leg is pyarrow
+reading Parquet files, and the ratio between them would carry two changes at
+once — the boundary, and a different reader. It has to match the server's call
+exactly, too: reading whole files instead of the server's `iter_batches`
+reports 35 ms and makes the boundary look twice as expensive as it is.
+
+**Crossing a process costs 2.4×, not an order of magnitude.** Two servers
 rather than one, on purpose: a client timed against a single server reports
 the protocol and that server's implementation as one number, and only a second
 implementation separates them. It separated them decisively here —

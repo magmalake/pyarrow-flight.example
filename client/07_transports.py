@@ -19,6 +19,7 @@ Every leg produces the same 79,478,796 rows, which is asserted rather than
 assumed: a transport that is fast because it lost rows is not fast.
 """
 
+import asyncio
 import glob
 import os
 import sys
@@ -29,6 +30,11 @@ sys.path.insert(0, ".")
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from collections.abc import AsyncIterator
+
+from daft.io import DataSource, DataSourceTask
+from daft.recordbatch import RecordBatch
+from daft.schema import Schema
 
 from daft_flight import FlightSource, IcebergLocalSource, ShmSource
 
@@ -54,6 +60,70 @@ def measure(label: str, make_source) -> tuple[str, float, int]:
         samples.append((time.perf_counter() - start) * 1000)
     samples.sort()
     return label, samples[len(samples) // 2], rows
+
+
+class _LocalParquet(DataSource):
+    """The control: the server's own read, in this process.
+
+    Every Flight leg has pyarrow decoding Parquet on one side and Daft folding
+    Arrow on the other. This is the same two halves with nothing between them —
+    the identical `iter_batches` call the server makes, handed straight to
+    Daft — so the difference against a Flight leg is the boundary and nothing
+    else.
+
+    Without it the in-process row would be `iceberg.mojo` reading an Iceberg
+    table while the Flight rows are pyarrow reading Parquet files, and the
+    ratio between them would carry two changes at once.
+    """
+
+    def __init__(self, table_dir: str, column: str) -> None:
+        self._files = sorted(
+            glob.glob(os.path.join(table_dir, "data", "**", "*.parquet"), recursive=True)
+        )
+        field = pq.ParquetFile(self._files[0]).schema_arrow.field(column)
+        self._arrow_schema = pa.schema([field])
+        self._schema = Schema.from_pyarrow_schema(self._arrow_schema)
+        self._column = column
+
+    @property
+    def name(self) -> str:
+        return "local-parquet"
+
+    @property
+    def schema(self) -> Schema:
+        return self._schema
+
+    def display_name(self) -> str:
+        return f"LocalParquet({len(self._files)} files, in-process)"
+
+    async def get_tasks(self, pushdowns) -> AsyncIterator[DataSourceTask]:
+        for path in self._files:
+            yield _LocalParquetTask(path, self._column, self._schema, self._arrow_schema)
+
+
+class _LocalParquetTask(DataSourceTask):
+    def __init__(self, path, column, schema, arrow_schema) -> None:
+        self._path, self._column = path, column
+        self._schema, self._arrow_schema = schema, arrow_schema
+
+    @property
+    def schema(self) -> Schema:
+        return self._schema
+
+    async def read(self) -> AsyncIterator[RecordBatch]:
+        # Off the event loop for the same reason every other task here is:
+        # Daft drives them on one loop and a decode blocks it.
+        # The server's exact call, batch size and all: `iter_batches` with a
+        # column projection. Reading the whole file at once would be a
+        # different decode — bigger batches, less per-batch work — and the
+        # comparison would stop being about the boundary.
+        batches = await asyncio.to_thread(
+            lambda: list(
+                pq.ParquetFile(self._path).iter_batches(columns=[self._column])
+            )
+        )
+        for batch in batches:
+            yield RecordBatch.from_arrow_record_batches([batch], self._arrow_schema)
 
 
 def ipc_file() -> str:
@@ -93,6 +163,11 @@ def read_ipc(path: str, mapped: bool) -> int:
 
 
 legs = []
+if TABLE:
+    legs.append(
+        ("in-process (pyarrow, no boundary)",
+         lambda: _LocalParquet(TABLE, COLUMN))
+    )
 if LIB and TABLE:
     legs.append(
         (
