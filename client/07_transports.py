@@ -49,15 +49,23 @@ def measure(label: str, make_source) -> tuple[str, float, int]:
     """p50 of `REPEAT` full reads, after a discarded warm-up.
 
     The source is built once and re-read, because building it plans the scan
-    and planning is not what this measures.
+    and planning is not what this measures. A leg that starts processes hands
+    back a teardown with its source, and it is called before the next leg
+    begins — otherwise one leg's producers are still resident while the next
+    one is timed.
     """
-    source = make_source()
-    source.read().count_rows()
-    samples = []
-    for _ in range(REPEAT):
-        start = time.perf_counter()
-        rows = source.read().count_rows()
-        samples.append((time.perf_counter() - start) * 1000)
+    built = make_source()
+    source, teardown = built if isinstance(built, tuple) else (built, None)
+    try:
+        source.read().count_rows()
+        samples = []
+        for _ in range(REPEAT):
+            start = time.perf_counter()
+            rows = source.read().count_rows()
+            samples.append((time.perf_counter() - start) * 1000)
+    finally:
+        if teardown is not None:
+            teardown()
     samples.sort()
     return label, samples[len(samples) // 2], rows
 
@@ -189,20 +197,26 @@ publisher_bin = os.environ.get("SHM_PUBLISH_BIN")
 if publisher_bin and TABLE and os.path.exists(publisher_bin):
     from daft_flight.shm_direct import ShmDirectSource, _Publisher
 
-    _pub = _Publisher(
-        publisher_bin,
-        TABLE,
-        COLUMN,
-        os.environ.get("SHM_DIRECT_DIR", "/tmp/ib-shm"),
-        SPLIT_SIZE,
-        env={"CONDA_PREFIX": os.environ["MAGMALAKE_SHIM_PREFIX"]}
-        if os.environ.get("MAGMALAKE_SHIM_PREFIX")
-        else None,
-    )
-    legs.append(
-        ("shared memory, Mojo writes the buffers",
-         lambda: ShmDirectSource(_pub))
-    )
+    def start_publishers():
+        """Built when the leg runs, not when the list is made.
+
+        A pool of producer processes is eight Mojo runtimes holding scan
+        buffers. Starting them up front left them resident through every other
+        leg, and the legs measured after them came out slower for it.
+        """
+        pub = _Publisher(
+            publisher_bin,
+            TABLE,
+            COLUMN,
+            os.environ.get("SHM_DIRECT_DIR", "/tmp/ib-shm"),
+            SPLIT_SIZE,
+            env={"CONDA_PREFIX": os.environ["MAGMALAKE_SHIM_PREFIX"]}
+            if os.environ.get("MAGMALAKE_SHIM_PREFIX")
+            else None,
+        )
+        return ShmDirectSource(pub), pub.close
+
+    legs.append(("shared memory, Mojo writes the buffers", start_publishers))
 
 # The same server, answering with the name of a mapping instead of the rows.
 # Flight stays the control plane; only DoGet changes.

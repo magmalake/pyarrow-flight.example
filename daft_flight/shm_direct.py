@@ -73,13 +73,24 @@ class _Worker:
         )
         self.tickets: list[str] = json.loads(self._proc.stdout.readline())["tickets"]
 
-    def publish(self, ticket: str) -> list[dict]:
+    def publish(self, ticket: str):
+        """Ask for a ticket; yield each batch as soon as it lands.
+
+        A generator rather than a list, because the producer prints a line per
+        batch as it writes it: the consumer can be folding the first batch
+        while the second is still being written. Waiting for the whole split
+        left both sides idle in turn.
+        """
         self._proc.stdin.write(ticket + "\n")
         self._proc.stdin.flush()
-        line = self._proc.stdout.readline()
-        if not line:
-            raise RuntimeError("shm publisher exited")
-        return json.loads(line)["batches"]
+        while True:
+            line = self._proc.stdout.readline()
+            if not line:
+                raise RuntimeError("shm publisher exited")
+            message = json.loads(line)
+            if "end" in message:
+                return
+            yield message["batch"]
 
     def close(self) -> None:
         if self._proc.poll() is None:
@@ -112,11 +123,16 @@ class _Publisher:
         for w in self._workers:
             self._free.put(w)
 
-    def publish(self, ticket: str) -> list[dict]:
-        """Hand over one ticket; get back where its batches landed."""
+    def publish(self, ticket: str):
+        """Hand over one ticket; yield where each batch landed, as it lands.
+
+        The worker is held for the whole stream — it is mid-conversation on a
+        pipe — and released when the split ends or the consumer gives up.
+        """
         worker = self._free.get()
         try:
-            return worker.publish(ticket)
+            for entry in worker.publish(ticket):
+                yield entry
         finally:
             self._free.put(worker)
 
@@ -166,10 +182,40 @@ def _column(mapping: pa.Buffer, spec: dict) -> pa.Array:
     )
 
 
-def read_batch(entry: dict) -> pa.RecordBatch:
+class _Mappings:
+    """The mappings a task has open, one per split rather than per batch.
+
+    Several batches share a file now — the producer sizes one region for the
+    whole split and writes each batch into it — so mapping it once per batch
+    would be three needless `mmap`s and three needless unmaps per split.
+    pyarrow keeps each mapping alive through the arrays built on it, so this
+    only has to avoid opening the same path twice.
+    """
+
+    def __init__(self) -> None:
+        self._open: dict[str, pa.Buffer] = {}
+
+    def buffer(self, path: str) -> pa.Buffer:
+        mapping = self._open.get(path)
+        if mapping is None:
+            with pa.memory_map(path, "rb") as source:
+                mapping = source.read_buffer(os.path.getsize(path))
+            self._open[path] = mapping
+        return mapping
+
+    def done(self) -> None:
+        """Unlink what we mapped; the pages live on while arrays reference them."""
+        for path in self._open:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        self._open.clear()
+
+
+def read_batch(entry: dict, mappings: _Mappings) -> pa.RecordBatch:
     """A published batch, as Arrow, with nothing copied."""
-    with pa.memory_map(entry["path"], "rb") as source:
-        mapping = source.read_buffer(os.path.getsize(entry["path"]))
+    mapping = mappings.buffer(entry["path"])
     columns = [_column(mapping, c) for c in entry["columns"]]
     return pa.RecordBatch.from_arrays(
         columns, names=[c["name"] for c in entry["columns"]]
@@ -181,8 +227,12 @@ class ShmDirectSource(DataSource):
 
     def __init__(self, publisher: _Publisher) -> None:
         self._publisher = publisher
-        first = publisher.publish(publisher.tickets[0])
-        self._arrow_schema = read_batch(first[0]).schema
+        # The schema costs one batch, and the rest of that split is drained so
+        # the worker is free again — a stream left half-read would block the
+        # next ticket it is given.
+        first = list(publisher.publish(publisher.tickets[0]))
+        self._priming = _Mappings()
+        self._arrow_schema = read_batch(first[0], self._priming).schema
         self._schema = Schema.from_pyarrow_schema(self._arrow_schema)
         self._primed = {publisher.tickets[0]: first}
 
@@ -199,41 +249,61 @@ class ShmDirectSource(DataSource):
 
     async def get_tasks(self, pushdowns: Pushdowns) -> AsyncIterator[DataSourceTask]:
         for ticket in self._publisher.tickets:
+            primed = self._primed.pop(ticket, None)
             yield _ShmDirectTask(
                 self._publisher, ticket, self._schema, self._arrow_schema,
-                self._primed.pop(ticket, None), pushdowns.limit,
+                primed, pushdowns.limit,
+                self._priming if primed else None,
             )
 
 
 class _ShmDirectTask(DataSourceTask):
-    def __init__(self, publisher, ticket, schema, arrow_schema, primed, limit) -> None:
+    def __init__(self, publisher, ticket, schema, arrow_schema, primed, limit,
+                 mappings=None) -> None:
         self._publisher, self._ticket = publisher, ticket
         self._schema, self._arrow_schema = schema, arrow_schema
         self._primed, self._limit = primed, limit
+        # The primed split was mapped while reading the schema; reuse those
+        # mappings rather than opening the same paths again.
+        self._mappings = mappings
 
     @property
     def schema(self) -> Schema:
         return self._schema
 
     async def read(self) -> AsyncIterator[RecordBatch]:
-        # Off the event loop: the producer is scanning Parquet before it
-        # answers, and Daft drives every task on one loop.
-        entries = self._primed or await asyncio.to_thread(
-            self._publisher.publish, self._ticket
+        # A generator over a pipe, stepped off the event loop: the producer is
+        # scanning Parquet between lines, and Daft drives every task on one
+        # loop. `next` rather than a for-loop so each wait is its own thread
+        # hop and the batch already in hand can be folded meanwhile.
+        entries = iter(self._primed) if self._primed else self._publisher.publish(
+            self._ticket
         )
+        mappings = self._mappings or _Mappings()
         seen = 0
-        for entry in entries:
-            batch = await asyncio.to_thread(read_batch, entry)
+
+        def next_batch():
+            """Wait for the producer and map what it points at, in one hop.
+
+            Two `to_thread` calls per batch — one to wait, one to read — cost
+            two dispatches and two GIL handoffs for work that is a single
+            step: there is nothing to do between them.
+            """
+            entry = next(entries, None)
+            return None if entry is None else (entry, read_batch(entry, mappings))
+
+        while True:
+            got = await asyncio.to_thread(next_batch)
+            if got is None:
+                mappings.done()
+                return
+            entry, batch = got
             if self._limit is not None:
                 remaining = self._limit - seen
                 if remaining <= 0:
+                    mappings.done()
                     return
                 if batch.num_rows > remaining:
                     batch = batch.slice(0, remaining)
             seen += batch.num_rows
             yield RecordBatch.from_arrow_record_batches([batch], self._arrow_schema)
-            # The mapping is the consumer's now; the file has done its job.
-            try:
-                os.unlink(entry["path"])
-            except FileNotFoundError:
-                pass

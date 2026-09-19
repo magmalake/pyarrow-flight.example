@@ -197,22 +197,22 @@ each way across the boundary and prints them side by side. Apple M4, warm
 cache, p50 of five reads:
 
 ```
-  in-process (pyarrow, no boundary)      62.0 ms     1.0x   79,478,796 rows
-  in-process (C Data Interface)         88.9 ms     1.4x   79,478,796 rows
-  Flight — pyarrow server              150.5 ms     2.4x   79,478,796 rows
-  Flight — flight.mojo server          388.5 ms     6.3x   79,478,796 rows
-  shared memory, Mojo writes the buffers     254.1 ms     4.1x   79,478,796 rows
-  shared mapping, named by Flight      243.5 ms     3.9x   79,478,796 rows
+  in-process (pyarrow, no boundary)      62.5 ms     1.0x   79,478,796 rows
+  in-process (C Data Interface)          88.9 ms     1.4x   79,478,796 rows
+  shared memory, Mojo writes the buffers 112.4 ms     1.8x   79,478,796 rows
+  Flight — pyarrow server               147.7 ms     2.4x   79,478,796 rows
+  shared mapping, named by Flight        227.9 ms     3.6x   79,478,796 rows
+  Flight — flight.mojo server            378.0 ms     6.0x   79,478,796 rows
 
   the handover alone — one column, already Arrow, no Parquet in it:
-  Arrow IPC, memory-mapped (zero copy)           24.0 ms
-  Arrow IPC, read into the heap (one copy)       55.1 ms
+  Arrow IPC, memory-mapped (zero copy)           25.2 ms
+  Arrow IPC, read into the heap (one copy)       56.2 ms
 ```
 
-The two mapping legs are **noisier than the rest** — 236–295 ms and 169–232 ms
-across four runs, where the streaming legs hold within a few percent. They
-write hundreds of megabytes through the page cache per run and the streaming
-legs do not, so read a single run's figure as a range.
+The mapping legs are **noisier than the rest** — the Flight-named one ranged
+219–400 ms across three runs where everything else held within a few percent.
+They write hundreds of megabytes through the page cache per run and the
+streaming legs do not, so read a single figure as a range.
 
 **The first leg is the control**, and it is what makes the rest mean anything:
 pyarrow reading the files and handing Daft the batches, which is exactly what
@@ -243,42 +243,45 @@ with a note. It needs the taxi table from
 [`taxibench.example`](https://github.com/magmalake/taxibench.example)
 (`pixi run load` there), and `TAXI_TABLE` points it anywhere else.
 
-**`shm_direct.py` is the one with no encoding in it at all.** `iceberg.mojo`'s
-`ib-shm-publish` scans a split and writes its Arrow buffers straight into a
-mapping — the layout they already have — then prints a manifest of offsets.
-This process maps the file, wraps each buffer with `pa.foreign_buffer`, and
-hands Daft arrays that point into the mapping. Nothing is decoded and nothing
-is allocated for the data on this side.
+**`shm_direct.py` is the one with no encoding in it at all**, and it is the
+fastest way across a process boundary here. `iceberg.mojo`'s `ib-shm-publish`
+scans a split and writes its Arrow buffers straight into a mapping — the
+layout they already have — publishing each batch as it lands. This process
+maps the file once per split and wraps the buffers with `pa.foreign_buffer`.
+Nothing is decoded, and nothing is allocated for the data on this side: Daft's
+arrays point into the mapping, which is easy to verify by mutating the bytes
+underneath one.
 
-It is not free, and the producer is where the cost is: its decode wrote the
-buffers somewhere, and publishing moves them into the mapping. That is the
-same copy an in-process C Data Interface export makes, so this is a
-cross-process handover at the price of an in-process one. Removing it means
-the Parquet decode allocating inside the mapping to begin with, which is a
-change to the reader rather than to the protocol —
-[memory-region.mojo](https://github.com/magmalake/memory-region.mojo) is the
-half of that which exists.
+It took three goes to get there, and none of them was the copy everyone
+expects:
 
-Two things the leg measures that are not the mechanism, both worth knowing
-before reading the number. The producer runs as a **pool** of processes: one
-would serialise every split behind a single pipe and measure how fast one core
-decodes Parquet. And `iceberg.mojo` reading an Iceberg table is about 1.4×
-slower than pyarrow reading the same Parquet files, which the two in-process
-rows show directly — most of what separates this leg from the one below it.
+| | |
+|---|---|
+| one mapping per **batch** | 288 ms |
+| one mapping per **split**, batches streamed into it | ~150 ms |
+| one thread hop per batch instead of two | 112 ms |
 
-**The shared mapping is the interesting one.** `daft_flight/shm.py` is the same
-Flight plan with a different `DoGet`: the server writes an endpoint's rows into
-a mapping and returns its *path*, and the client maps it — legal because a
-ticket is opaque bytes, and useful because Arrow's IPC file layout is the
-in-memory layout, so mapping it is not a decode. The C Data Interface cannot do
-this across processes at all; it hands over pointers.
+A mapping's create/size/map/unmap/unlink cycle measures 4.01 ms per 8 MB
+batch against 3.05 ms for the copy inside it — so the lifecycle was the larger
+half all along, and paying it four times per split was the whole problem. The
+copy that this work set out to remove is worth about 4 ms of a 28 ms producer;
+removing it properly means the Parquet decode allocating inside the mapping,
+which is a change to `ArrayData`'s buffers rather than to this protocol.
 
-It still loses to streaming, for a reason worth knowing: the consumer's half is
-nearly free (1.9 ms to map one endpoint and fold every value, against 12 ms to
-stream it) but the producer has to get the rows *into* the mapping, and those
-writes overlap far worse than a stream does — 1.3× across 24 endpoints where
-streaming manages 2.4×. Avoiding one copy pays for another until the buffers
-are allocated in the mapping to begin with.
+**It is not comparable to the rows above it**, which is why the table keeps
+them apart: this leg changes two things at once. Its decoder is
+`iceberg.mojo`, about 1.4× slower than the pyarrow one every other row uses,
+and its producer is a pool of processes rather than one threaded server, so it
+is not paying for a GIL. It reads faster *despite* the slower decoder, which
+is the interesting part, but a like-for-like transport comparison it is not.
+
+**The shared mapping named by Flight** is the like-for-like one: pyarrow on
+both sides, with `DoGet` answering with the name of a mapping it wrote the
+rows into rather than the rows. It is slower than streaming them (228 ms
+against 148 ms), and the reason is not the mechanism but what a mapping
+forces: the producer must materialise a whole split before the consumer may
+touch any of it, and both sides fault every page. A stream overlaps producer
+and consumer and writes into kernel buffers that are already resident.
 
 A Unix socket is not faster here — 581 ms against 149 ms on macOS, measured
 either side of the TCP run. `server/parquet_server.py --unix /tmp/f.sock` is
