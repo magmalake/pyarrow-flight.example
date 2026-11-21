@@ -45,7 +45,7 @@ jobs:
           cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Re-solve the Python deps to their newest releases
-        if: matrix.os == 'macos-latest'
+        if: github.event_name == 'schedule'
         run: |
           pixi update
           pixi list '^(pyarrow|libarrow-flight|daft|polars|duckdb|pandas)$'
@@ -103,7 +103,7 @@ jobs:
           key: flight-mojo-pixi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flight.mojo/pixi.lock') }}
 
       - name: Re-solve the Python deps to their newest releases
-        if: matrix.os == 'macos-latest'
+        if: github.event_name == 'schedule'
         working-directory: pyarrow-flight.example
         run: pixi update
 
