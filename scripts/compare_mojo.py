@@ -8,8 +8,8 @@ validity bitmap or a misread timestamp gets past properties with.
 
 The oracle is pyarrow reading the table's Parquet files directly, so nothing
 here is transcribed from either server's output. The schema is compared with
-the reference server's, which declares the same five columns, and the error
-cases client/04_errors.py prints are asserted.
+the reference server's, which declares the same five columns, and every bad
+ticket is checked for its gRPC status.
 
     python scripts/compare_mojo.py build/check-mojo/warehouse
 """
@@ -79,23 +79,36 @@ if by_id:
 if not {r["id"] for r in pa.concat_tables(CHUNKS).to_pylist()} <= set(ids):
     mismatch("the reference server's ids 1..7 are not all served")
 
-# The error cases, which client/04_errors.py prints rather than asserts.
-try:
-    # A real ticket (this snapshot, a byte range) naming a file the snapshot
-    # has no task for. 04_errors.py sends snapshot 0, which no table has, and
-    # the server refuses that one: a different case.
-    snapshot, start, length, _ = info.endpoints[0].ticket.ticket.decode().split("|", 3)
-    stale = f"{snapshot}|{start}|{length}|/nonexistent.parquet".encode()
-    stale = client.do_get(fl.Ticket(stale)).read_all()
-    if stale.num_rows != 0:
-        mismatch(f"a stale ticket returned {stale.num_rows} rows, not an empty stream")
-except Exception as e:  # noqa: BLE001
-    mismatch(f"a stale ticket raised {type(e).__name__}: {e}; it should come back empty")
-try:
-    client.do_get(fl.Ticket(b"not-a-ticket")).read_all()
-    mismatch("a malformed ticket was answered instead of refused")
-except Exception:  # noqa: BLE001
-    pass
+# The error cases. client/04_errors.py checks the same three against both
+# servers; this adds the cases where flight.mojo's ticket parser has more to
+# refuse, and checks each status, not just that something was raised. A bad
+# ticket is the client's mistake: INVALID_ARGUMENT (ArrowInvalid) or
+# NOT_FOUND (ArrowKeyError), and never INTERNAL (FlightInternalError).
+snapshot, start, length, path = info.endpoints[0].ticket.ticket.decode().split("|", 3)
+EMPTY = "an empty stream"
+for raw, want, status in [
+    # A snapshot the table does not have: nothing to read it against.
+    (b"0|0|0|/nonexistent.parquet", pa.lib.ArrowKeyError, "NOT_FOUND"),
+    # The table's snapshot, and a piece its plan does not have: the stale
+    # ticket, answered with no rows rather than failing the query.
+    (f"{snapshot}|{start}|{length}|/nonexistent.parquet".encode(), None, EMPTY),
+    (f"{snapshot}|999999999|{length}|{path}".encode(), None, EMPTY),
+    # Malformed.
+    (b"not-a-ticket", pa.lib.ArrowInvalid, "INVALID_ARGUMENT"),
+    (b"", pa.lib.ArrowInvalid, "INVALID_ARGUMENT"),
+    (b"x|0|0|/a.parquet", pa.lib.ArrowInvalid, "INVALID_ARGUMENT"),
+    (f"{snapshot}|-1|0|{path}".encode(), pa.lib.ArrowInvalid, "INVALID_ARGUMENT"),
+    (b"\xff|0|0|/a.parquet", pa.lib.ArrowInvalid, "INVALID_ARGUMENT"),
+]:
+    try:
+        got = client.do_get(fl.Ticket(raw)).read_all()
+        if want is not None:
+            mismatch(f"ticket {raw[:40]!r} returned {got.num_rows} rows; expected {status}")
+        elif got.num_rows != 0:
+            mismatch(f"ticket {raw[:40]!r} returned {got.num_rows} rows; expected {EMPTY}")
+    except Exception as e:  # noqa: BLE001
+        if want is None or not isinstance(e, want):
+            mismatch(f"ticket {raw[:40]!r} raised {type(e).__name__}; expected {status}: {e}")
 try:
     list(client.list_flights())
     mismatch("ListFlights answered; the server implements only the read path")

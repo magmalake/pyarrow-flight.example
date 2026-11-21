@@ -90,6 +90,22 @@ onto `ArrowNotImplementedError`, which is not in the `flight` namespace at all.
 The `Flight*Error` classes cover fewer cases than gRPC's status list, so a
 catch-all is the honest way to handle server errors — see `client/04_errors.py`.
 
+**A bad ticket is the client's mistake, and both servers here say so.** What
+comes back tells a client what to do next, which is why neither server
+answers one with INTERNAL (`FlightInternalError`, for the server's own
+faults):
+
+| ticket | status | pyarrow raises |
+|---|---|---|
+| malformed: not `<snapshot>\|<start>\|<length>\|<path>` | INVALID_ARGUMENT | `ArrowInvalid` |
+| a snapshot the table does not have (`0\|0\|0\|/nonexistent.parquet`) | NOT_FOUND | `ArrowKeyError` |
+| stale: the table's snapshot, naming a piece it does not have | OK, an empty stream | — |
+
+NOT_FOUND means plan again with `GetFlightInfo`. An empty answer there would
+let a client that fans out assemble a table with part of it silently missing;
+a stale ticket at a snapshot that still exists, by contrast, really does name
+none of its rows.
+
 **A schema in `FlightInfo` is an encapsulated IPC message**, not a bare
 flatbuffer: the continuation marker and length prefix are part of it. This one
 is for anyone *writing* a server — send a bare one and every client reports
@@ -114,8 +130,9 @@ writes flight.mojo's gate table (seven rows like the reference server's, and
 600 more in a file of many small row groups, so the plan splits into more
 endpoints than files); serves it on 8815; and runs every example against it.
 Then it fetches every endpoint and compares each row with pyarrow reading the
-table's Parquet files directly, and asserts the error cases `04_errors.py`
-only prints. Any difference fails it.
+table's Parquet files directly, and checks the status of every bad ticket
+(`04_errors.py` checks the three it shows, against both servers). Any
+difference fails it.
 
 flight.mojo builds from source against its siblings, so `../flight.mojo` needs
 them next to it: `flare_mlake`, `threads.mojo`, `iceberg.mojo` and the read
