@@ -46,12 +46,45 @@ CHUNKS = [
 ]
 
 
+SNAPSHOT = 1
+"""The one snapshot this table has. Its tickets name it, as flight.mojo's do."""
+
+
+def ticket_for(i):
+    """flight.mojo's ticket format, `<snapshot>|<start>|<length>|<path>`.
+
+    Tickets are opaque to a client, so nothing in client/ depends on this.
+    Using the Mojo server's shape is what lets the same bad tickets mean the
+    same thing to both servers, and be answered the same way (see `do_get`).
+    """
+    return f"{SNAPSHOT}|0|{CHUNKS[i].num_rows}|chunk-{i}".encode()
+
+
+def parse_ticket(raw):
+    """(snapshot, start, path), refusing what is not a ticket.
+
+    `ValueError` is what pyarrow answers INVALID_ARGUMENT (`ArrowInvalid` on
+    the client), and `KeyError` NOT_FOUND (`ArrowKeyError`); anything else
+    would be INTERNAL or UNKNOWN, which is for the server's own faults.
+    """
+    try:
+        snapshot, start, length, path = raw.decode().split("|", 3)
+        snapshot, start, length = int(snapshot), int(start), int(length)
+    except ValueError:  # UnicodeDecodeError is a ValueError too
+        raise ValueError(
+            "malformed ticket, expected '<snapshot>|<start>|<length>|<path>'"
+        ) from None
+    if start < 0 or length < 0 or not path:
+        raise ValueError("malformed ticket, a negative range or an empty path")
+    return snapshot, start, path
+
+
 class Reference(fl.FlightServerBase):
     def get_flight_info(self, context, descriptor):
         # One endpoint per chunk, no location: "fetch from the server you
         # asked", which is what a single-process server means.
         endpoints = [
-            fl.FlightEndpoint(str(i).encode(), []) for i in range(len(CHUNKS))
+            fl.FlightEndpoint(ticket_for(i), []) for i in range(len(CHUNKS))
         ]
         return fl.FlightInfo(
             SCHEMA,
@@ -62,8 +95,17 @@ class Reference(fl.FlightServerBase):
         )
 
     def do_get(self, context, ticket):
-        which = int(ticket.ticket.decode())
-        return fl.RecordBatchStream(CHUNKS[which])
+        # The same three answers flight.mojo gives: a malformed ticket is
+        # INVALID_ARGUMENT, a snapshot the table does not have is NOT_FOUND,
+        # and a ticket at a real snapshot for a piece it does not have is a
+        # stale one, answered with an empty stream rather than failing.
+        snapshot, start, path = parse_ticket(ticket.ticket)
+        if snapshot != SNAPSHOT:
+            raise KeyError(f"snapshot {snapshot} is not in the table; plan again")
+        for i, chunk in enumerate(CHUNKS):
+            if start == 0 and path == f"chunk-{i}":
+                return fl.RecordBatchStream(chunk)
+        return fl.RecordBatchStream(SCHEMA.empty_table())
 
 
 if __name__ == "__main__":

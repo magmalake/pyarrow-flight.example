@@ -8,11 +8,13 @@ platforms = ["osx-arm64", "linux-64"]
 
 [dependencies]
 python = "3.12.*"
-pyarrow = ">=21"
+# Capped below 26: every daft 0.7.x requires pyarrow <26, so without the cap a
+# fresh solve (the weekly CI run) has no answer.
+pyarrow = ">=21,<26"
 # pyarrow's conda build splits Flight into its own library. Without this,
 # `import pyarrow.flight` fails at the dlopen with "not built with support for
 # 'flight'" — which reads like a missing feature rather than a missing package.
-libarrow-flight = ">=21"
+libarrow-flight = ">=21,<26"
 polars = ">=1"
 duckdb = ">=1"
 pandas = ">=2"
