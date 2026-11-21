@@ -9,6 +9,7 @@ actually get at this from Python".
 
 ```sh
 pixi run check              # every example, against a reference server
+pixi run check-mojo         # the same examples against flight.mojo's server
 ```
 
 Nothing in `client/` knows the server is written in Mojo. That is the point:
@@ -105,10 +106,26 @@ reports UNAVAILABLE — which looks like a network fault and is not one.
 without a Mojo toolchain — and so that an example failing against the Mojo
 server can be told apart from an example that was wrong to begin with.
 
-For the real thing, see [`server/README.md`](server/README.md):
-[`flight.mojo`](https://github.com/magmalake/flight.mojo)'s `serve` task hosts a
-fixed table, and `serve-iceberg` hosts a real Iceberg table with one endpoint
-per scan split — that second one is what makes `02_fan_out.py` interesting.
+`pixi run check-mojo` is the real thing, end to end. It builds
+[`flight.mojo`](https://github.com/magmalake/flight.mojo)'s Iceberg server
+(`serve-iceberg`) from a checkout at `../flight.mojo`, in that checkout's own
+pixi environment, so this repository still has no Mojo toolchain of its own;
+writes flight.mojo's gate table (seven rows like the reference server's, and
+600 more in a file of many small row groups, so the plan splits into more
+endpoints than files); serves it on 8815; and runs every example against it.
+Then it fetches every endpoint and compares each row with pyarrow reading the
+table's Parquet files directly, and asserts the error cases `04_errors.py`
+only prints. Any difference fails it.
+
+flight.mojo builds from source against its siblings, so `../flight.mojo` needs
+them next to it: `flare_mlake`, `threads.mojo`, `iceberg.mojo` and the read
+stack (`parquet.mojo`, `arrow-mlake.mojo`, `avro.mojo`, the codecs, …), the
+layout of the magmalake tins. `FLIGHT_MOJO` points it elsewhere. The org's
+nightly canary runs it in exactly that layout, against each new Mojo nightly.
+
+See [`server/README.md`](server/README.md) for running a server by hand:
+`serve` hosts a fixed table, and `serve-iceberg` a real Iceberg table with one
+endpoint per scan split — the one that makes `02_fan_out.py` interesting.
 
 ## Daft
 
@@ -145,7 +162,8 @@ a `[pypi-dependencies]` entry here.
 in this process (`iceberg.mojo`'s `carrow-scan-lib`), handing Daft its Arrow
 buffers over the C Data Interface with nothing encoded, sent or decoded. Same
 plan, same ticket format, same DataFrame; only how a task reads differs. It
-needs that library built, so `pixi run check` does not cover it.
+needs that library built, so neither `pixi run check` nor `check-mojo` covers
+it.
 
 Prefer it whenever it is available: in one process Flight's encode, socket and
 decode are overhead against a function call.

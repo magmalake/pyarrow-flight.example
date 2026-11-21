@@ -81,7 +81,12 @@ if not {r["id"] for r in pa.concat_tables(CHUNKS).to_pylist()} <= set(ids):
 
 # The error cases, which client/04_errors.py prints rather than asserts.
 try:
-    stale = client.do_get(fl.Ticket(b"0|0|0|/nonexistent.parquet")).read_all()
+    # A real ticket (this snapshot, a byte range) naming a file the snapshot
+    # has no task for. 04_errors.py sends snapshot 0, which no table has, and
+    # the server refuses that one: a different case.
+    snapshot, start, length, _ = info.endpoints[0].ticket.ticket.decode().split("|", 3)
+    stale = f"{snapshot}|{start}|{length}|/nonexistent.parquet".encode()
+    stale = client.do_get(fl.Ticket(stale)).read_all()
     if stale.num_rows != 0:
         mismatch(f"a stale ticket returned {stale.num_rows} rows, not an empty stream")
 except Exception as e:  # noqa: BLE001

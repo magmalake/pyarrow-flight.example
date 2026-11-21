@@ -11,7 +11,9 @@ cd ../flight.mojo && pixi run serve   # 127.0.0.1:8815
 
 `flight.mojo` also has `serve-iceberg`, which serves a real Iceberg table and
 advertises one endpoint per scan split — that is the one worth pointing
-`02_fan_out.py` at.
+`02_fan_out.py` at. `pixi run check-mojo` here does all of it: builds that
+server from `../flight.mojo`, serves a small generated table, runs every
+example against it and compares what it served with pyarrow's own read.
 
 **A Python server** (`python server/reference_server.py`), which exists so the
 client examples can be checked against an implementation nobody here wrote. If
