@@ -120,8 +120,12 @@ only prints. Any difference fails it.
 flight.mojo builds from source against its siblings, so `../flight.mojo` needs
 them next to it: `flare_mlake`, `threads.mojo`, `iceberg.mojo` and the read
 stack (`parquet.mojo`, `arrow-mlake.mojo`, `avro.mojo`, the codecs, …), the
-layout of the magmalake tins. `FLIGHT_MOJO` points it elsewhere. The org's
-nightly canary runs it in exactly that layout, against each new Mojo nightly.
+layout of the magmalake tins. `FLIGHT_MOJO` points it elsewhere. This
+repository's CI runs `check` and `check-mojo` on Linux for every pull request
+and push to main, with flight.mojo and its siblings checked out at `main`, and
+weekly against the newest releases of the Python dependencies (and on macOS
+too); the org's nightly canary runs it in the same layout against each new
+Mojo nightly.
 
 See [`server/README.md`](server/README.md) for running a server by hand:
 `serve` hosts a fixed table, and `serve-iceberg` a real Iceberg table with one
