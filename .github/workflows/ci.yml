@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, because the Python side floats (pyarrow >=21, daft, polars,
+  # duckdb): the scheduled run re-solves to the newest releases instead of
+  # pixi.lock, so an upstream release that breaks an example shows up here
+  # rather than in a reader's first `pixi run check`. macOS runs then and by
+  # hand (Actions > CI > Run workflow), not on PRs or main: GitHub's hosted
+  # macOS pool is short on capacity, and a job that never gets a runner fails
+  # the required `ci` gate.
+  schedule:
+    - cron: '37 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Every example against the Python reference server. No Mojo anywhere.
+  check:
+    name: check / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          # Pinned to match every other magmalake repo: pixi.lock is written
+          # by 0.78.0, and an unpinned pixi rejects it as not up-to-date.
+          pixi-version: v0.78.0
+          # The weekly run re-solves (below), so it must not install the lock.
+          run-install: ${{ github.event_name != 'schedule' }}
+          cache: ${{ github.event_name != 'schedule' }}
+          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Re-solve the Python deps to their newest releases
+        if: github.event_name == 'schedule'
+        run: |
+          pixi update
+          pixi list '^(pyarrow|libarrow-flight|daft|polars|duckdb|pandas)$'
+
+      - name: Every example against the reference server
+        run: pixi run check
+
+  # The same examples against flight.mojo's Iceberg server, built from a
+  # sibling checkout of flight.mojo at main in flight.mojo's own pixi
+  # environment, and every row it serves compared with pyarrow's read of the
+  # table's files. flight.mojo takes only the codecs' C shims by git rev; the
+  # Mojo sources of flare and the read stack come from `-I ../<tin>` paths
+  # (see its serve-iceberg task), so those are checked out beside it, at main.
+  # Everything lives inside the workspace so hashFiles can see flight.mojo's
+  # lock for the cache key.
+  check-mojo:
+    name: check-mojo / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pyarrow-flight.example
+
+      - name: Check out flight.mojo and its siblings at main
+        run: |
+          for repo in flight.mojo flare_mlake threads.mojo iceberg.mojo parquet.mojo \
+                      arrow-mlake.mojo memory-region.mojo avro.mojo deflate.mojo \
+                      thrift.mojo zstd.mojo snappy.mojo lz4.mojo brotli.mojo \
+                      hashes.mojo roaring.mojo objectstore.mojo; do
+            git clone --quiet --depth 1 --branch main "https://github.com/magmalake/$repo.git"
+            echo "$repo $(git -C "$repo" rev-parse --short HEAD)"
+          done
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.78.0
+          manifest-path: pyarrow-flight.example/pixi.toml
+          run-install: ${{ github.event_name != 'schedule' }}
+          cache: ${{ github.event_name != 'schedule' }}
+          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      # flight.mojo's environment: the Mojo nightly, pyarrow/pyiceberg for the
+      # fixture, and the codec shims its git dependencies build from source.
+      # Keyed on its lock, which moves with every Mojo pin. flare's own shims
+      # are not in here to go stale: its activation scripts rebuild them
+      # whenever the installed copy is older than the fresh checkout.
+      - uses: actions/cache@v4
+        with:
+          path: flight.mojo/.pixi
+          key: flight-mojo-pixi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flight.mojo/pixi.lock') }}
+
+      - name: Re-solve the Python deps to their newest releases
+        if: github.event_name == 'schedule'
+        working-directory: pyarrow-flight.example
+        run: pixi update
+
+      - name: Every example against flight.mojo's server, rows compared with pyarrow
+        working-directory: pyarrow-flight.example
+        run: pixi run check-mojo
+
+  # The one check to require: both jobs above passed. Not on the weekly
+  # schedule, where nothing is waiting on it.
+  ci:
+    if: ${{ always() && github.event_name != 'schedule' }}
+    needs: [check, check-mojo]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS"])
+          results = {k: v["result"] for k, v in needs.items()}
+          print("results:", results)
+          bad = {k: r for k, r in results.items() if r != "success"}
+          if bad:
+              sys.exit(f"did not succeed: {bad}")
+          PY
