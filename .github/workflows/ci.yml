@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON('["ubuntu-latest", "macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +45,7 @@ jobs:
           cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Re-solve the Python deps to their newest releases
-        if: github.event_name == 'schedule'
+        if: matrix.os == 'macos-latest'
         run: |
           pixi update
           pixi list '^(pyarrow|libarrow-flight|daft|polars|duckdb|pandas)$'
@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON('["ubuntu-latest", "macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -103,7 +103,7 @@ jobs:
           key: flight-mojo-pixi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flight.mojo/pixi.lock') }}
 
       - name: Re-solve the Python deps to their newest releases
-        if: github.event_name == 'schedule'
+        if: matrix.os == 'macos-latest'
         working-directory: pyarrow-flight.example
         run: pixi update
 
