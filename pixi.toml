@@ -43,7 +43,12 @@ example-pushdown = { cmd = "python client/06_pushdown.py" }
 # and (for the third leg) flight.mojo's server, so it is not part of `check`.
 transports = { cmd = "bash scripts/transports.sh" }
 
-# Every example against the reference server, which is what CI runs: it proves
-# the client code is correct without needing a Mojo toolchain. Pointing the
-# same examples at flight.mojo is the manual step the README describes.
+# Every example against the reference server: it proves the client code is
+# correct without needing a Mojo toolchain.
 check = { cmd = "bash scripts/check.sh" }
+
+# The same examples against flight.mojo's Iceberg server, built from
+# ../flight.mojo (with its siblings beside it) in that checkout's own pixi
+# environment, on a small generated table, and every row it serves compared
+# with the table's files read by pyarrow. See scripts/check-mojo.sh.
+check-mojo = { cmd = "bash scripts/check-mojo.sh" }
